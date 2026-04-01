@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Bash(wsl -e bash -c \"cd /mnt/f/Claudecode/KamaCache-Go-main && go build ./... 2>&1\")",
+      "Bash(wsl -e bash -c \"export PATH=$PATH:/usr/local/go/bin && cd /mnt/f/Claudecode/KamaCache-Go-main && go build ./... 2>&1\")",
+      "Bash(wsl -- which go)",
+      "Bash(wsl -- go version)",
+      "Bash(where go:*)",
+      "Bash(wsl -d Ubuntu -e bash -ic \"go version 2>&1; which go 2>&1\")",
+      "Bash(wsl -d Ubuntu -- bash -lc \"go version\")",
+      "Bash(wsl -d Ubuntu -- find / -name go -type f)"
+    ]
+  }
+}
