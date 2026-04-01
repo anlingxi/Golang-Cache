@@ -66,8 +66,14 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 			return nil, false
 		}
 
-		// 项目有效，晋升至二级缓存
-		s.caches[idx][1].put(key, n1.v, expireAt, s.onEvicted)
+		// 项目有效，从 level1 晋升至 level2（访问热升）
+		// level2 满时才触发用户的 onEvicted
+		level2Evict := func(evictedKey string, evictedVal Value, _ int64) {
+			if s.onEvicted != nil {
+				s.onEvicted(evictedKey, evictedVal)
+			}
+		}
+		s.caches[idx][1].put(key, n1.v, expireAt, level2Evict)
 		return n1.v, true
 	}
 
@@ -97,8 +103,21 @@ func (s *lru2Store) SetWithExpiration(key string, value Value, expiration time.D
 	s.locks[idx].Lock()
 	defer s.locks[idx].Unlock()
 
+	// level2 满时才真正淘汰，触发用户的 onEvicted
+	level2Evict := func(evictedKey string, evictedVal Value, _ int64) {
+		if s.onEvicted != nil {
+			s.onEvicted(evictedKey, evictedVal)
+		}
+	}
+
+	// level1 满时，不直接丢弃，而是晋升到 level2（给一次"第二次机会"）
+	// 这才是真正的 LRU2 语义：被 level1 淘汰的项有机会在 level2 继续存活
+	promoteToLevel2 := func(evictedKey string, evictedVal Value, evictedExpireAt int64) {
+		s.caches[idx][1].put(evictedKey, evictedVal, evictedExpireAt, level2Evict)
+	}
+
 	// 放入一级缓存
-	s.caches[idx][0].put(key, value, expireAt, s.onEvicted)
+	s.caches[idx][0].put(key, value, expireAt, promoteToLevel2)
 
 	return nil
 }
@@ -241,7 +260,8 @@ func Create(cap uint16) *cache {
 }
 
 // 向缓存中添加项，如果是新增返回 1，更新返回 0
-func (c *cache) put(key string, val Value, expireAt int64, onEvicted func(string, Value)) int {
+// onEvicted 回调包含 expireAt，允许调用方决定如何处理被淘汰的项（如晋升到下一级缓存）
+func (c *cache) put(key string, val Value, expireAt int64, onEvicted func(string, Value, int64)) int {
 	if idx, ok := c.hmap[key]; ok {
 		c.m[idx-1].v, c.m[idx-1].expireAt = val, expireAt
 		c.m[idx-1].deleted = false // 重置删除标记（key 可能被删后重新写入）
@@ -252,8 +272,9 @@ func (c *cache) put(key string, val Value, expireAt int64, onEvicted func(string
 	if c.last == uint16(cap(c.m)) {
 		tail := &c.m[c.dlnk[0][p]-1]
 		// 用 deleted 字段判断是否需要触发 onEvicted（逻辑删除的节点已通知过了）
+		// 把被淘汰节点的 expireAt 一并传出，让上层决定是否晋升到 level2
 		if onEvicted != nil && !(*tail).deleted {
-			onEvicted((*tail).k, (*tail).v)
+			onEvicted((*tail).k, (*tail).v, (*tail).expireAt)
 		}
 
 		delete(c.hmap, (*tail).k)
