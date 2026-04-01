@@ -9,7 +9,10 @@
       "Bash(where go:*)",
       "Bash(wsl -d Ubuntu -e bash -ic \"go version 2>&1; which go 2>&1\")",
       "Bash(wsl -d Ubuntu -- bash -lc \"go version\")",
-      "Bash(wsl -d Ubuntu -- find / -name go -type f)"
+      "Bash(wsl -d Ubuntu -- find / -name go -type f)",
+      "Bash(wsl -d Ubuntu -- wc -l /mnt/f/Claudecode/KamaCache-Go-main/store/lru2_test.go)",
+      "Bash(powershell -Command \"Get-Content ''F:\\\\Claudecode\\\\KamaCache-Go-main\\\\store\\\\lru2_test.go'' | Select-Object -First 864 | Set-Content ''F:\\\\Claudecode\\\\KamaCache-Go-main\\\\store\\\\lru2_test.go'' -Encoding UTF8; \\(Get-Content ''F:\\\\Claudecode\\\\KamaCache-Go-main\\\\store\\\\lru2_test.go''\\).Count\")",
+      "Bash(python3 -c \":*)"
     ]
   }
 }

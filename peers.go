@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/youngyangyang04/KamaCache-Go/circuitbreaker"
 	"github.com/youngyangyang04/KamaCache-Go/consistenthash"
 	"github.com/youngyangyang04/KamaCache-Go/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -32,14 +33,16 @@ type Peer interface {
 
 // ClientPicker 实现了PeerPicker接口
 type ClientPicker struct {
-	selfAddr string
-	svcName  string
-	mu       sync.RWMutex
-	consHash *consistenthash.Map
-	clients  map[string]*Client
-	etcdCli  *clientv3.Client
-	ctx      context.Context
-	cancel   context.CancelFunc
+	selfAddr    string
+	svcName     string
+	mu          sync.RWMutex
+	consHash    *consistenthash.Map
+	clients     map[string]*Client
+	breakers    map[string]*circuitbreaker.Breaker // 每个 peer 对应一个熔断器
+	breakerOpts circuitbreaker.Options             // 熔断器统一配置
+	etcdCli     *clientv3.Client
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // PickerOption 定义配置选项
@@ -67,12 +70,14 @@ func (p *ClientPicker) PrintPeers() {
 func NewClientPicker(addr string, opts ...PickerOption) (*ClientPicker, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	picker := &ClientPicker{
-		selfAddr: addr,
-		svcName:  defaultSvcName,
-		clients:  make(map[string]*Client),
-		consHash: consistenthash.New(),
-		ctx:      ctx,
-		cancel:   cancel,
+		selfAddr:    addr,
+		svcName:     defaultSvcName,
+		clients:     make(map[string]*Client),
+		breakers:    make(map[string]*circuitbreaker.Breaker),
+		breakerOpts: circuitbreaker.DefaultOptions(),
+		consHash:    consistenthash.New(),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
 	for _, opt := range opts {
@@ -177,31 +182,34 @@ func (p *ClientPicker) fetchAllServices() error {
 	return nil
 }
 
-// set 添加服务实例
+// set 添加服务实例，同时为其创建熔断器
 func (p *ClientPicker) set(addr string) {
 	if client, err := NewClient(addr, p.svcName, p.etcdCli); err == nil {
 		p.consHash.Add(addr)
 		p.clients[addr] = client
+		p.breakers[addr] = circuitbreaker.New(addr, p.breakerOpts)
 		logrus.Infof("Successfully created client for %s", addr)
 	} else {
 		logrus.Errorf("Failed to create client for %s: %v", addr, err)
 	}
 }
 
-// remove 移除服务实例
+// remove 移除服务实例，同时清理熔断器
 func (p *ClientPicker) remove(addr string) {
 	p.consHash.Remove(addr)
 	delete(p.clients, addr)
+	delete(p.breakers, addr)
 }
 
-// PickPeer 选择peer节点
+// PickPeer 选择peer节点，返回带熔断器保护的 guardedClient
 func (p *ClientPicker) PickPeer(key string) (Peer, bool, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	if addr := p.consHash.Get(key); addr != "" {
 		if client, ok := p.clients[addr]; ok {
-			return client, true, addr == p.selfAddr
+			breaker := p.breakers[addr]
+			return &guardedClient{client: client, breaker: breaker}, true, addr == p.selfAddr
 		}
 	}
 	return nil, false, false
@@ -237,4 +245,67 @@ func parseAddrFromKey(key, svcName string) string {
 		return strings.TrimPrefix(key, prefix)
 	}
 	return ""
+}
+
+// guardedClient 用熔断器包装 *Client，实现 Peer 接口。
+//
+// 对 group.go 完全透明：group.go 只知道拿到了一个 Peer，
+// 不感知熔断器的存在。熔断逻辑集中在这里。
+type guardedClient struct {
+	client  *Client
+	breaker *circuitbreaker.Breaker
+}
+
+// allow 检查熔断器，返回是否允许请求通过。
+// breaker 为 nil 时（未配置熔断器）直接放行。
+func (g *guardedClient) allow() error {
+	if g.breaker == nil {
+		return nil
+	}
+	return g.breaker.Allow()
+}
+
+// report 向熔断器上报结果。
+func (g *guardedClient) report(success bool) {
+	if g.breaker != nil {
+		g.breaker.Report(success)
+	}
+}
+
+// Get 实现 Peer.Get，带熔断保护
+func (g *guardedClient) Get(group, key string) ([]byte, error) {
+	if err := g.allow(); err != nil {
+		logrus.Warnf("[CircuitBreaker] peer %s is open, fast-fail Get: %v", g.client.addr, err)
+		return nil, err
+	}
+	val, err := g.client.Get(group, key)
+	g.report(err == nil)
+	return val, err
+}
+
+// Set 实现 Peer.Set，带熔断保护
+func (g *guardedClient) Set(ctx context.Context, group, key string, value []byte) error {
+	if err := g.allow(); err != nil {
+		logrus.Warnf("[CircuitBreaker] peer %s is open, fast-fail Set: %v", g.client.addr, err)
+		return err
+	}
+	err := g.client.Set(ctx, group, key, value)
+	g.report(err == nil)
+	return err
+}
+
+// Delete 实现 Peer.Delete，带熔断保护
+func (g *guardedClient) Delete(group, key string) (bool, error) {
+	if err := g.allow(); err != nil {
+		logrus.Warnf("[CircuitBreaker] peer %s is open, fast-fail Delete: %v", g.client.addr, err)
+		return false, err
+	}
+	ok, err := g.client.Delete(group, key)
+	g.report(err == nil)
+	return ok, err
+}
+
+// Close 实现 Peer.Close
+func (g *guardedClient) Close() error {
+	return g.client.Close()
 }

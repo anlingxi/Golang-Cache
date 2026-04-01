@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/youngyangyang04/KamaCache-Go/bloomfilter"
 	"github.com/youngyangyang04/KamaCache-Go/singleflight"
 	"google.golang.org/grpc/metadata"
 )
@@ -47,21 +48,23 @@ type Group struct {
 	mainCache  *Cache
 	peers      PeerPicker
 	loader     *singleflight.Group
-	expiration time.Duration // 缓存过期时间，0表示永不过期
-	closed     int32         // 原子变量，标记组是否已关闭
-	stats      groupStats    // 统计信息
+	bloom      *bloomfilter.BloomFilter // 布隆过滤器，防缓存穿透；nil 表示禁用
+	expiration time.Duration            // 缓存过期时间，0表示永不过期
+	closed     int32                    // 原子变量，标记组是否已关闭
+	stats      groupStats               // 统计信息
 }
 
 // groupStats 保存组的统计信息
 type groupStats struct {
-	loads        int64 // 加载次数
-	localHits    int64 // 本地缓存命中次数
-	localMisses  int64 // 本地缓存未命中次数
-	peerHits     int64 // 从对等节点获取成功次数
-	peerMisses   int64 // 从对等节点获取失败次数
-	loaderHits   int64 // 从加载器获取成功次数
-	loaderErrors int64 // 从加载器获取失败次数
-	loadDuration int64 // 加载总耗时（纳秒）
+	loads         int64 // 加载次数
+	localHits     int64 // 本地缓存命中次数
+	localMisses   int64 // 本地缓存未命中次数
+	peerHits      int64 // 从对等节点获取成功次数
+	peerMisses    int64 // 从对等节点获取失败次数
+	loaderHits    int64 // 从加载器获取成功次数
+	loaderErrors  int64 // 从加载器获取失败次数
+	loadDuration  int64 // 加载总耗时（纳秒）
+	bloomFiltered int64 // 被布隆过滤器拦截的请求数（key 一定不存在）
 }
 
 // GroupOption 定义Group的配置选项
@@ -85,6 +88,19 @@ func WithPeers(peers PeerPicker) GroupOption {
 func WithCacheOptions(opts CacheOptions) GroupOption {
 	return func(g *Group) {
 		g.mainCache = NewCache(opts)
+	}
+}
+
+// WithBloomFilter 启用布隆过滤器防止缓存穿透。
+//
+//	expectedKeys: 预期最多存入缓存的 key 数量（建议留 20% 余量）
+//	fpRate:       目标假阳性率，推荐 0.01（1%）
+//
+// 启用后，对从未被 Set/加载过的 key 的查询，布隆过滤器能以接近 100% 的概率
+// 直接拦截，避免穿透到数据源。代价是每个 Get 多一次内存访问（约 100ns）。
+func WithBloomFilter(expectedKeys uint, fpRate float64) GroupOption {
+	return func(g *Group) {
+		g.bloom = bloomfilter.New(expectedKeys, fpRate)
 	}
 }
 
@@ -142,6 +158,14 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 		return ByteView{}, ErrKeyRequired
 	}
 
+	// 布隆过滤器快速拦截：如果 key 一定不存在，直接返回，避免穿透到数据源
+	// 注意：只有当 bloom != nil 且 MightContain 返回 false 时才拦截。
+	// 返回 false 意味着该 key 从未被 Set 或从数据源成功加载过。
+	if g.bloom != nil && !g.bloom.MightContain(key) {
+		atomic.AddInt64(&g.stats.bloomFiltered, 1)
+		return ByteView{}, fmt.Errorf("key %q not found", key)
+	}
+
 	// 从本地缓存获取
 	view, ok := g.mainCache.Get(ctx, key)
 	if ok {
@@ -180,6 +204,11 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 		g.mainCache.AddWithExpiration(key, view, time.Now().Add(g.expiration))
 	} else {
 		g.mainCache.Add(key, view)
+	}
+
+	// 将 key 注册到布隆过滤器，后续对该 key 的 Get 不再被拦截
+	if g.bloom != nil {
+		g.bloom.Add(key)
 	}
 
 	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
@@ -307,6 +336,12 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 		g.mainCache.Add(key, view)
 	}
 
+	// 数据源加载成功后，将 key 注册到布隆过滤器
+	// 后续对该 key 的 Get 请求不再被拦截，可以直接走本地缓存
+	if g.bloom != nil {
+		g.bloom.Add(key)
+	}
+
 	return view, nil
 }
 
@@ -358,16 +393,17 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 // Stats 返回缓存统计信息
 func (g *Group) Stats() map[string]interface{} {
 	stats := map[string]interface{}{
-		"name":          g.name,
-		"closed":        atomic.LoadInt32(&g.closed) == 1,
-		"expiration":    g.expiration,
-		"loads":         atomic.LoadInt64(&g.stats.loads),
-		"local_hits":    atomic.LoadInt64(&g.stats.localHits),
-		"local_misses":  atomic.LoadInt64(&g.stats.localMisses),
-		"peer_hits":     atomic.LoadInt64(&g.stats.peerHits),
-		"peer_misses":   atomic.LoadInt64(&g.stats.peerMisses),
-		"loader_hits":   atomic.LoadInt64(&g.stats.loaderHits),
-		"loader_errors": atomic.LoadInt64(&g.stats.loaderErrors),
+		"name":           g.name,
+		"closed":         atomic.LoadInt32(&g.closed) == 1,
+		"expiration":     g.expiration,
+		"loads":          atomic.LoadInt64(&g.stats.loads),
+		"local_hits":     atomic.LoadInt64(&g.stats.localHits),
+		"local_misses":   atomic.LoadInt64(&g.stats.localMisses),
+		"peer_hits":      atomic.LoadInt64(&g.stats.peerHits),
+		"peer_misses":    atomic.LoadInt64(&g.stats.peerMisses),
+		"loader_hits":    atomic.LoadInt64(&g.stats.loaderHits),
+		"loader_errors":  atomic.LoadInt64(&g.stats.loaderErrors),
+		"bloom_filtered": atomic.LoadInt64(&g.stats.bloomFiltered),
 	}
 
 	// 计算各种命中率
@@ -379,6 +415,16 @@ func (g *Group) Stats() map[string]interface{} {
 	totalLoads := stats["loads"].(int64)
 	if totalLoads > 0 {
 		stats["avg_load_time_ms"] = float64(atomic.LoadInt64(&g.stats.loadDuration)) / float64(totalLoads) / float64(time.Millisecond)
+	}
+
+	// 布隆过滤器状态
+	if g.bloom != nil {
+		stats["bloom_enabled"] = true
+		stats["bloom_fill_ratio"] = g.bloom.FillRatio()
+		stats["bloom_k"] = g.bloom.K()
+		stats["bloom_m_bits"] = g.bloom.M()
+	} else {
+		stats["bloom_enabled"] = false
 	}
 
 	// 添加缓存大小
