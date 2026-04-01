@@ -1,7 +1,10 @@
 package store
 
 import (
+<<<<<<< HEAD
 	"fmt"
+=======
+>>>>>>> 1bc2209 (init)
 	"sync"
 	"sync/atomic"
 	"time"
